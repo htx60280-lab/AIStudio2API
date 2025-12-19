@@ -25,6 +25,23 @@ class PageController:
         self.page = page
         self.logger = logger
         self.req_id = req_id
+        self._selector_cache: Dict[str, str] = {}
+
+    async def _get_cached_locator(self, cache_key: str, selectors: List[str], timeout: int):
+        cached_selector = self._selector_cache.get(cache_key)
+        if cached_selector:
+            try:
+                locator = self.page.locator(cached_selector)
+                if await locator.count() > 0:
+                    first = locator.first
+                    if await first.is_visible():
+                        return first, cached_selector
+            except Exception:
+                pass
+        locator, matched = await get_first_visible_locator(self.page, selectors, timeout=timeout)
+        if matched:
+            self._selector_cache[cache_key] = matched
+        return locator, matched
 
     async def _check_disconnect(self, check_client_disconnected: Callable, stage: str):
         if check_client_disconnected(stage):
@@ -754,7 +771,7 @@ class PageController:
             self.logger.warning(f"[{self.req_id}] 未找到媒体添加按钮。")
             return False
 
-        upload_menu_locator, _ = await get_first_visible_locator(self.page, UPLOAD_BUTTON_SELECTORS, timeout=1000)
+        upload_menu_locator, _ = await self._get_cached_locator('upload_menu', UPLOAD_BUTTON_SELECTORS, timeout=1000)
         
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -772,7 +789,7 @@ class PageController:
             
             for _ in range(10):
                 try:
-                    upload_menu_locator, matched_upload = await get_first_visible_locator(self.page, UPLOAD_BUTTON_SELECTORS, timeout=500)
+                    upload_menu_locator, matched_upload = await self._get_cached_locator('upload_menu', UPLOAD_BUTTON_SELECTORS, timeout=500)
                     if upload_menu_locator and await upload_menu_locator.is_visible():
                         self.logger.info(f"[{self.req_id}] ✅ 'Upload file' 菜单项已检测到开启 (匹配: {matched_upload})。")
                         return True
@@ -816,7 +833,7 @@ class PageController:
             if not menu_opened:
                 self.logger.warning(f"[{self.req_id}] 未能打开菜单，尝试直接查找 input...")
             
-            file_input, matched_input = await get_first_visible_locator(self.page, HIDDEN_FILE_INPUT_SELECTORS + ['input[type="file"]'], timeout=2000)
+            file_input, matched_input = await self._get_cached_locator('file_input', HIDDEN_FILE_INPUT_SELECTORS + ['input[type="file"]'], timeout=2000)
             if not file_input:
                 file_input = self.page.locator('input[type="file"]').first
             
@@ -844,7 +861,7 @@ class PageController:
                     menu_opened = await self._robust_click_insert_assets(check_client_disconnected)
                     if not menu_opened:
                         continue
-                    file_input, _ = await get_first_visible_locator(self.page, HIDDEN_FILE_INPUT_SELECTORS + ['input[type="file"]'], timeout=2000)
+                    file_input, _ = await self._get_cached_locator('file_input', HIDDEN_FILE_INPUT_SELECTORS + ['input[type="file"]'], timeout=2000)
                     if not file_input:
                         file_input = self.page.locator('input[type="file"]').first
                 
@@ -955,7 +972,7 @@ class PageController:
 
     async def submit_prompt(self, prompt: str, image_list: List, check_client_disconnected: Callable):
         self.logger.info(f'[{self.req_id}] 📤 提交提示 ({len(prompt)} chars)...')
-        prompt_textarea_locator, matched_selector = await get_first_visible_locator(self.page, PROMPT_TEXTAREA_SELECTORS, timeout=5000)
+        prompt_textarea_locator, matched_selector = await self._get_cached_locator('prompt_textarea', PROMPT_TEXTAREA_SELECTORS, timeout=5000)
         if not prompt_textarea_locator:
             self.logger.warning(f'[{self.req_id}] 未找到输入框，尝试默认选择器')
             prompt_textarea_locator = self.page.locator(PROMPT_TEXTAREA_SELECTOR)
@@ -968,7 +985,7 @@ class PageController:
             if await loc.count() > 0:
                 autosize_wrapper_locator = loc
                 break
-        submit_button_locator, submit_matched = await get_first_visible_locator(self.page, SUBMIT_BUTTON_SELECTORS, timeout=3000)
+        submit_button_locator, submit_matched = await self._get_cached_locator('submit_button', SUBMIT_BUTTON_SELECTORS, timeout=3000)
         if not submit_button_locator:
             submit_button_locator = self.page.locator(SUBMIT_BUTTON_SELECTOR)
         else:

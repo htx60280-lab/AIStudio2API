@@ -111,6 +111,11 @@ async def _shutdown_resources():
     import server
     logger = server.logger
     logger.info('Shutting down resources...')
+    try:
+        from .utils import close_helper_session
+        await close_helper_session()
+    except Exception as e:
+        logger.warning(f'Failed to close helper HTTP session: {e}')
     if server.STREAM_PROCESS:
         server.STREAM_PROCESS.terminate()
         logger.info('STREAM proxy terminated.')

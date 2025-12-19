@@ -604,7 +604,16 @@ async def get_response_via_copy_button(page: AsyncPage, req_id: str, check_clien
         logger.info(f'[{req_id}]   - 尝试悬停最后一条消息以显示选项...')
         await last_message_container.hover(timeout=CLICK_TIMEOUT_MS)
         check_client_disconnected('复制响应 - 悬停后: ')
-        await asyncio.sleep(0.5)
+        if consecutive_empty_input_submit_disabled_count > 0:
+            sleep_time = 0.2
+        else:
+            if current_time_elapsed_ms < 10000:
+                sleep_time = 0.2
+            elif current_time_elapsed_ms < 30000:
+                sleep_time = 0.5
+            else:
+                sleep_time = 1.0
+        await asyncio.sleep(sleep_time)
         check_client_disconnected('复制响应 - 悬停后延时后: ')
         logger.info(f'[{req_id}]   - 已悬停。')
         logger.info(f"[{req_id}]   - 定位并点击 '更多选项' 按钮...")
@@ -687,12 +696,17 @@ async def _wait_for_response_completion(page: AsyncPage, prompt_textarea_locator
             check_client_disconnected_func('等待响应完成 - 超时检查后')
         except ClientDisconnectedError:
             return False
-        is_input_empty = await prompt_textarea_locator.input_value() == ''
+        is_input_empty = False
         is_submit_disabled = False
         try:
             is_submit_disabled = await submit_button_locator.is_disabled(timeout=wait_timeout_ms_short)
         except TimeoutError:
             logger.warning(f'[{req_id}] (WaitV3) 检查提交按钮是否禁用超时。为本次检查假定其未禁用。')
+        if is_submit_disabled:
+            try:
+                is_input_empty = await prompt_textarea_locator.input_value() == ''
+            except Exception:
+                is_input_empty = False
         try:
             check_client_disconnected_func('等待响应完成 - 按钮状态检查后')
         except ClientDisconnectedError:

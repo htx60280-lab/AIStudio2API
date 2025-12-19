@@ -44,11 +44,29 @@ async def _analyze_model_requirements(req_id: str, context: dict, request: ChatC
 
 async def _test_client_connection(req_id: str, http_request: Request) -> bool:
     from server import logger
+    state = getattr(http_request, 'state', None)
+    if state:
+        try:
+            now = time.time()
+            last_ts = getattr(state, '_last_disconnect_check_ts', 0.0)
+            if now - last_ts < 0.2:
+                return getattr(state, '_last_disconnect_check_ok', True)
+        except Exception:
+            pass
+
+    def _cache_result(result: bool) -> bool:
+        if state:
+            try:
+                state._last_disconnect_check_ts = time.time()
+                state._last_disconnect_check_ok = result
+            except Exception:
+                pass
+        return result
     try:
         is_disconnected = await http_request.is_disconnected()
         if is_disconnected:
             logger.info(f'[{req_id}] 🚨 检测到客户端断开 - is_disconnected() = True')
-            return False
+            return _cache_result(False)
         if hasattr(http_request, '_receive'):
             import asyncio
             try:
@@ -60,21 +78,21 @@ async def _test_client_connection(req_id: str, http_request: Request) -> bool:
                     logger.info(f"[{req_id}] 🔍 收到ASGI消息: type={message_type}, body_size={len(message.get('body', b''))}, more_body={message.get('more_body', 'N/A')}")
                     if message_type == 'http.disconnect':
                         logger.info(f'[{req_id}] 🚨 Cherry Studio停止信号 - http.disconnect')
-                        return False
+                        return _cache_result(False)
                     if message_type in ['websocket.disconnect', 'websocket.close']:
                         logger.info(f'[{req_id}] 🚨 WebSocket断开信号 - {message_type}')
-                        return False
+                        return _cache_result(False)
                     if message_type == 'http.request':
                         body = message.get('body', b'')
                         more_body = message.get('more_body', True)
                         if body == b'' and (not more_body):
                             logger.info(f'[{req_id}] 🚨 空body停止信号')
-                            return False
+                            return _cache_result(False)
                         if body:
                             body_str = body.decode('utf-8', errors='ignore').lower()
                             if any((stop_word in body_str for stop_word in ['abort', 'cancel', 'stop'])):
                                 logger.info(f'[{req_id}] 🚨 检测到停止关键词在body中: {body_str[:100]}')
-                                return False
+                                return _cache_result(False)
                 else:
                     for task in pending:
                         task.cancel()
@@ -89,7 +107,7 @@ async def _test_client_connection(req_id: str, http_request: Request) -> bool:
                 error_msg = str(e).lower()
                 if any((keyword in error_msg for keyword in ['disconnect', 'closed', 'abort', 'cancel', 'reset', 'broken'])):
                     logger.info(f'[{req_id}] 🚨 异常表示断开连接: {e}')
-                    return False
+                    return _cache_result(False)
         try:
             if hasattr(http_request, 'scope'):
                 scope = http_request.scope
@@ -97,16 +115,16 @@ async def _test_client_connection(req_id: str, http_request: Request) -> bool:
                 if transport:
                     if hasattr(transport, 'is_closing') and transport.is_closing():
                         logger.info(f'[{req_id}] 🚨 传输层正在关闭')
-                        return False
+                        return _cache_result(False)
                     if hasattr(transport, 'is_closed') and transport.is_closed():
                         logger.info(f'[{req_id}] 🚨 传输层已关闭')
-                        return False
+                        return _cache_result(False)
         except Exception:
             pass
-        return True
+        return _cache_result(True)
     except Exception as e:
         logger.warning(f'[{req_id}] 连接检测总异常: {e}')
-        return False
+        return _cache_result(False)
 
 async def _setup_disconnect_monitoring(req_id: str, http_request: Request, result_future: Future, page: AsyncPage) -> Tuple[Event, asyncio.Task, Callable]:
     from server import logger

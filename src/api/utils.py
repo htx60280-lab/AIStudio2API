@@ -11,6 +11,7 @@ import requests
 import os
 import hashlib
 import threading
+import aiohttp
 
 from config.timeouts import BASE_STREAM_RETRIES
 
@@ -45,10 +46,31 @@ class RequestCancellationManager:
     def get_active_requests(self) -> List[Dict[str, Any]]:
         with self._lock:
             result = []
+            now = time.time()
             for req_id, info in self._active_requests.items():
-                result.append({'req_id': req_id, 'cancelled': info['cancelled'], 'duration': time.time() - info['start_time'], **info.get('info', {})})
+                result.append({'req_id': req_id, 'cancelled': info['cancelled'], 'duration': now - info['start_time'], **info.get('info', {})})
             return result
 request_manager = RequestCancellationManager()
+
+_helper_session: Optional[aiohttp.ClientSession] = None
+_helper_session_lock = asyncio.Lock()
+
+async def get_helper_session() -> aiohttp.ClientSession:
+    global _helper_session
+    if _helper_session and not _helper_session.closed:
+        return _helper_session
+    async with _helper_session_lock:
+        if _helper_session and not _helper_session.closed:
+            return _helper_session
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        _helper_session = aiohttp.ClientSession(timeout=timeout)
+        return _helper_session
+
+async def close_helper_session():
+    global _helper_session
+    if _helper_session and not _helper_session.closed:
+        await _helper_session.close()
+    _helper_session = None
 
 def calculate_stream_max_retries(messages: List[Message]) -> int:
     base_retries = BASE_STREAM_RETRIES
@@ -83,17 +105,17 @@ def calculate_stream_max_retries(messages: List[Message]) -> int:
 
 def generate_sse_chunk(delta: str, req_id: str, model: str) -> str:
     chunk_data = {'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': delta}, 'finish_reason': None}]}
-    return f'data: {json.dumps(chunk_data)}\n\n'
+    return f'data: {json.dumps(chunk_data, separators=(",", ":"))}\n\n'
 
 def generate_sse_stop_chunk(req_id: str, model: str, reason: str='stop', usage: dict=None) -> str:
     stop_chunk_data = {'id': f'chatcmpl-{req_id}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': reason}]}
     if usage:
         stop_chunk_data['usage'] = usage
-    return f'data: {json.dumps(stop_chunk_data)}\n\ndata: [DONE]\n\n'
+    return f'data: {json.dumps(stop_chunk_data, separators=(",", ":"))}\n\ndata: [DONE]\n\n'
 
 def generate_sse_error_chunk(message: str, req_id: str, error_type: str='server_error') -> str:
     error_chunk = {'error': {'message': message, 'type': error_type, 'param': None, 'code': req_id}}
-    return f'data: {json.dumps(error_chunk)}\n\n'
+    return f'data: {json.dumps(error_chunk, separators=(",", ":"))}\n\n'
 
 async def use_stream_response(req_id: str, max_empty_retries: int = 300) -> AsyncGenerator[Any, None]:
     from server import STREAM_QUEUE, logger
@@ -107,7 +129,7 @@ async def use_stream_response(req_id: str, max_empty_retries: int = 300) -> Asyn
     try:
         while True:
             try:
-                data = STREAM_QUEUE.get_nowait()
+                data = await asyncio.to_thread(STREAM_QUEUE.get, True, 0.2)
                 if data is None:
                     logger.info(f'[{req_id}] 🛑 接收到流结束标志')
                     break
@@ -166,18 +188,17 @@ async def clear_stream_queue():
 
 async def use_helper_get_response(helper_endpoint: str, helper_sapisid: str) -> AsyncGenerator[str, None]:
     from server import logger
-    import aiohttp
     logger.info(f'正在尝试使用Helper端点: {helper_endpoint}')
     try:
-        async with aiohttp.ClientSession() as session:
-            headers = {'Content-Type': 'application/json', 'Cookie': f'SAPISID={helper_sapisid}' if helper_sapisid else ''}
-            async with session.get(helper_endpoint, headers=headers) as response:
-                if response.status == 200:
-                    async for chunk in response.content.iter_chunked(1024):
-                        if chunk:
-                            yield chunk.decode('utf-8', errors='ignore')
-                else:
-                    logger.error(f'Helper端点返回错误状态: {response.status}')
+        session = await get_helper_session()
+        headers = {'Content-Type': 'application/json', 'Cookie': f'SAPISID={helper_sapisid}' if helper_sapisid else ''}
+        async with session.get(helper_endpoint, headers=headers) as response:
+            if response.status == 200:
+                async for chunk in response.content.iter_chunked(1024):
+                    if chunk:
+                        yield chunk.decode('utf-8', errors='ignore')
+            else:
+                logger.error(f'Helper端点返回错误状态: {response.status}')
     except Exception as e:
         logger.error(f'使用Helper端点时出错: {e}')
 
@@ -322,11 +343,12 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(chinese_tokens + english_tokens))
 
 def calculate_usage_stats(messages: List[dict], response_content: str, reasoning_content: str=None) -> dict:
-    prompt_text = ''
+    prompt_parts = []
     for message in messages:
         role = message.get('role', '')
         content = message.get('content', '')
-        prompt_text += f'{role}: {content}\n'
+        prompt_parts.append(f'{role}: {content}\n')
+    prompt_text = ''.join(prompt_parts)
     prompt_tokens = estimate_tokens(prompt_text)
     completion_text = response_content or ''
     if reasoning_content:

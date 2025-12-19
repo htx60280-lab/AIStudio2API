@@ -112,7 +112,7 @@ def ensure_auth_dirs_exist():
         logger.error(f'  ❌ 创建认证目录失败: {e}', exc_info=True)
         sys.exit(1)
 
-def cleanup():
+def cleanup(force: bool = False):
     global camoufox_proc
     logger.info('--- 开始执行清理程序 (launch_camoufox.py) ---')
     if camoufox_proc and camoufox_proc.poll() is None:
@@ -128,8 +128,12 @@ def cleanup():
                     logger.info(f'  Camoufox 进程组 (PID: {pid}) 未找到，尝试直接终止进程...')
                     camoufox_proc.terminate()
             elif sys.platform == 'win32':
-                logger.info(f'进程树 (PID: {pid}) 发送终止请求')
-                subprocess.call(['taskkill', '/T', '/PID', str(pid)])
+                if force:
+                    logger.info(f'进程树 (PID: {pid}) 发送强制终止请求')
+                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(pid)])
+                else:
+                    logger.info(f'进程树 (PID: {pid}) 发送终止请求')
+                    subprocess.call(['taskkill', '/T', '/PID', str(pid)])
             else:
                 logger.info(f'  向 Camoufox (PID: {pid}) 发送 SIGTERM 信号...')
                 camoufox_proc.terminate()
@@ -176,6 +180,38 @@ def signal_handler(sig, frame):
     sys.exit(0)
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+_console_handler_ref = None
+
+def register_windows_console_handler():
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception as e:
+        logger.warning(f'Failed to setup Windows console handler: {e}')
+        return
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    @handler_type
+    def _handler(ctrl_type):
+        try:
+            logger.info(f'收到控制台关闭事件 ({ctrl_type})，准备清理...')
+            cleanup(force=True)
+        except Exception:
+            pass
+        return True
+
+    try:
+        if ctypes.windll.kernel32.SetConsoleCtrlHandler(_handler, True):
+            global _console_handler_ref
+            _console_handler_ref = _handler
+            logger.info('已注册 Windows 控制台关闭事件清理处理器。')
+        else:
+            logger.warning('SetConsoleCtrlHandler 注册失败。')
+    except Exception as e:
+        logger.warning(f'Failed to register console handler: {e}')
 
 def check_dependencies():
     logger.info('--- 步骤 1: 检查依赖项 ---')
@@ -311,6 +347,101 @@ def kill_process_interactive(pid: int) -> bool:
         logger.error(f'    终止 PID {pid} 时发生意外错误: {e}', exc_info=True)
     return success
 
+def get_process_name(pid: int) -> str:
+    system_platform = platform.system()
+    try:
+        if system_platform == 'Windows':
+            result = subprocess.run(
+                ['tasklist', '/FI', f'PID eq {pid}', '/NH', '/FO', 'CSV'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            output = result.stdout.strip()
+            if output:
+                first_line = output.splitlines()[0]
+                if first_line:
+                    return first_line.split(',')[0].strip('"')
+        else:
+            result = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'comm='],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+    except Exception as e:
+        logger.warning(f'  Failed to get process name for PID {pid}: {e}')
+    return ''
+
+def get_process_commandline(pid: int) -> str:
+    system_platform = platform.system()
+    try:
+        if system_platform == 'Windows':
+            cmd = [
+                'powershell',
+                '-NoProfile',
+                '-Command',
+                f'(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                return result.stdout.strip()
+        else:
+            result = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'args='],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                return result.stdout.strip()
+    except Exception as e:
+        logger.warning(f'  Failed to get command line for PID {pid}: {e}')
+    return ''
+
+def is_probable_camoufox_process(process_name: str, command_line: str) -> bool:
+    name_lower = process_name.lower() if process_name else ''
+    cmd_lower = command_line.lower() if command_line else ''
+    if 'camoufox' in name_lower or 'firefox' in name_lower:
+        return True
+    if 'camoufox' in cmd_lower or 'launch_camoufox.py' in cmd_lower:
+        return True
+    if PROJECT_ROOT and PROJECT_ROOT.lower() in cmd_lower:
+        return True
+    return False
+
+def try_cleanup_camoufox_port(port: int, host: str = '127.0.0.1') -> bool:
+    pids = find_pids_on_port(port)
+    if not pids:
+        if not is_port_in_use(port, host=host):
+            return True
+        logger.warning(f'  Port {port} is in use, but no PID was found.')
+        return False
+    force_kill = os.environ.get('FORCE_KILL_CAMOUFOX_PORT', '').strip().lower() in ('1', 'true', 'yes')
+    skipped = []
+    for pid in pids:
+        process_name = get_process_name(pid)
+        command_line = get_process_commandline(pid)
+        if is_probable_camoufox_process(process_name, command_line):
+            logger.warning(f'  Port {port} in use by {process_name} (PID {pid}); attempting to terminate...')
+            if not kill_process_interactive(pid):
+                logger.warning(f'  Failed to terminate PID {pid} ({process_name}).')
+        elif force_kill:
+            logger.warning(f'  Port {port} in use by PID {pid}; force kill enabled.')
+            if not kill_process_interactive(pid):
+                logger.warning(f'  Failed to terminate PID {pid} ({process_name or "unknown"}).')
+        else:
+            skipped.append((pid, process_name or 'unknown'))
+    if skipped:
+        skipped_desc = ', '.join([f'{pid}:{name}' for pid, name in skipped])
+        logger.warning(f'  Port {port} is used by non-Camoufox processes; skipped: {skipped_desc}')
+    time.sleep(2)
+    if find_pids_on_port(port):
+        return False
+    return not is_port_in_use(port, host=host)
+
 def input_with_timeout(prompt_message: str, timeout_seconds: int=30) -> str:
     print(prompt_message, end='', flush=True)
     if sys.platform == 'win32':
@@ -416,6 +547,7 @@ if __name__ == '__main__':
     is_internal_call = any((arg.startswith('--internal-') for arg in sys.argv))
     if not is_internal_call:
         setup_launcher_logging(log_level=logging.INFO)
+        register_windows_console_handler()
     parser = argparse.ArgumentParser(description='Camoufox 浏览器模拟与 FastAPI 代理服务器的启动器。', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--internal-launch-mode', type=str, choices=['debug', 'headless', 'virtual_headless'], help=argparse.SUPPRESS)
     parser.add_argument('--internal-auth-file', type=str, default=None, help=argparse.SUPPRESS)
@@ -426,6 +558,7 @@ if __name__ == '__main__':
     parser.add_argument('--stream-port', type=int, default=DEFAULT_STREAM_PORT, help=f'流式代理服务器使用端口提供来禁用此功能 --stream-port=0 . 默认: {DEFAULT_STREAM_PORT}')
     parser.add_argument('--helper', type=str, default=DEFAULT_HELPER_ENDPOINT, help=f"Helper 服务器的 getStreamResponse 端点地址 (例如: http://127.0.0.1:3121/getStreamResponse). 提供空字符串 (例如: --helper='') 来禁用此功能. 默认: {DEFAULT_HELPER_ENDPOINT}")
     parser.add_argument('--camoufox-debug-port', type=int, default=DEFAULT_CAMOUFOX_PORT, help=f'内部 Camoufox 实例监听的调试端口号 (默认: {DEFAULT_CAMOUFOX_PORT})')
+    parser.add_argument('--skip-port-check', action='store_true', help='跳过 Camoufox 调试端口检查，直接启动 (用于端口被占用但仍想尝试启动的情况)')
     mode_selection_group = parser.add_mutually_exclusive_group()
     mode_selection_group.add_argument('--debug', action='store_true', help='启动调试模式 (浏览器界面可见，允许交互式认证)')
     mode_selection_group.add_argument('--headless', action='store_true', help='启动无头模式 (浏览器无界面，需要预先保存的认证文件)')
@@ -591,7 +724,31 @@ if __name__ == '__main__':
     else:
         logger.info(f'  ✅ 端口 {server_target_port} (主机 {uvicorn_bind_host}) 当前可用。')
         port_is_available = True
-    logger.info('--- 步骤 3: 准备并启动 Camoufox 内部进程 ---')
+    
+    # 检查 Camoufox 调试端口
+    logger.info(f'--- 步骤 3: 检查 Camoufox 调试端口 ({args.camoufox_debug_port}) 是否被占用 ---')
+    camoufox_port = args.camoufox_debug_port
+    camoufox_port_available = False
+    
+    pids_on_port = find_pids_on_port(camoufox_port)
+    port_in_use = bool(pids_on_port) or is_port_in_use(camoufox_port, host='127.0.0.1')
+    if port_in_use:
+        logger.warning(f'  ❌ Camoufox 调试端口 {camoufox_port} 当前被占用。')
+        logger.warning('  Attempting to clean up stale Camoufox/Firefox processes on this port...')
+        if try_cleanup_camoufox_port(camoufox_port, host='127.0.0.1'):
+            logger.info(f'  ✅ Camoufox 调试端口 {camoufox_port} 当前可用。')
+            camoufox_port_available = True
+        else:
+            if not getattr(args, 'skip_port_check', False):
+                logger.error(f'  ⚠️ 端口被占用，请使用 --skip-port-check 参数跳过端口检查，或手动终止占用端口的进程。')
+            else:
+                logger.error('  Port is still in use; aborting to avoid EADDRINUSE.')
+            sys.exit(1)
+    else:
+        logger.info(f'  ✅ Camoufox 调试端口 {camoufox_port} 当前可用。')
+        camoufox_port_available = True
+    
+    logger.info('--- 步骤 4: 准备并启动 Camoufox 内部进程 ---')
     captured_ws_endpoint = None
     effective_active_auth_json_path = None
     if args.active_auth_json:
@@ -801,41 +958,10 @@ if __name__ == '__main__':
     os.environ['STREAM_PORT'] = str(args.stream_port)
     proxy_config = determine_proxy_configuration(args.internal_camoufox_proxy)
     if proxy_config['stream_proxy']:
-        os.environ['UNIFIED_PROXY_CONFIG'] = proxy_config['stream_proxy']
-        logger.info(f"  设置统一代理配置: {proxy_config['source']}")
-    elif 'UNIFIED_PROXY_CONFIG' in os.environ:
-        del os.environ['UNIFIED_PROXY_CONFIG']
-    host_os_for_shortcut_env = None
-    camoufox_os_param_lower = simulated_os_for_camoufox.lower()
-    if camoufox_os_param_lower == 'macos':
-        host_os_for_shortcut_env = 'Darwin'
-    elif camoufox_os_param_lower == 'windows':
-        host_os_for_shortcut_env = 'Windows'
-    elif camoufox_os_param_lower == 'linux':
-        host_os_for_shortcut_env = 'Linux'
-    if host_os_for_shortcut_env:
-        os.environ['HOST_OS_FOR_SHORTCUT'] = host_os_for_shortcut_env
-    elif 'HOST_OS_FOR_SHORTCUT' in os.environ:
-        del os.environ['HOST_OS_FOR_SHORTCUT']
-    logger.info(f'  为 server.app 设置的环境变量:')
-    env_keys_to_log = ['CAMOUFOX_WS_ENDPOINT', 'LAUNCH_MODE', 'SERVER_LOG_LEVEL', 'SERVER_REDIRECT_PRINT', 'DEBUG_LOGS_ENABLED', 'TRACE_LOGS_ENABLED', 'ACTIVE_AUTH_JSON_PATH', 'AUTO_SAVE_AUTH', 'AUTH_SAVE_TIMEOUT', 'SERVER_PORT_INFO', 'HOST_OS_FOR_SHORTCUT', 'HELPER_ENDPOINT', 'HELPER_SAPISID', 'STREAM_PORT', 'UNIFIED_PROXY_CONFIG']
-    for key in env_keys_to_log:
-        if key in os.environ:
-            val_to_log = os.environ[key]
-            if key == 'CAMOUFOX_WS_ENDPOINT' and len(val_to_log) > 40:
-                val_to_log = val_to_log[:40] + '...'
-            if key == 'ACTIVE_AUTH_JSON_PATH':
-                val_to_log = os.path.basename(val_to_log)
-            logger.info(f'    {key}={val_to_log}')
-        else:
-            logger.info(f'    {key}= (未设置)')
-    logger.info(f'--- 步骤 5: 启动集成的 FastAPI 服务器 (监听端口: {args.server_port}) ---')
-    try:
-        uvicorn.run(app, host='0.0.0.0', port=args.server_port, log_config=None)
-        logger.info('Uvicorn 服务器已停止。')
-    except SystemExit as e_sysexit:
-        logger.info(f'Uvicorn 或其子系统通过 sys.exit({e_sysexit.code}) 退出。')
-    except Exception as e_uvicorn:
-        logger.critical(f'❌ 运行 Uvicorn 时发生致命错误: {e_uvicorn}', exc_info=True)
-        sys.exit(1)
-    logger.info('🚀 Camoufox 启动器主逻辑执行完毕 🚀')
+        os.environ['STREAM_PROXY'] = proxy_config['stream_proxy']
+    else:
+        if 'STREAM_PROXY' in os.environ:
+            del os.environ['STREAM_PROXY']
+    logger.info(f'  FastAPI 服务器将在端口 {args.server_port} 上启动...')
+    logger.info(f'  启动服务器，使用参数: --host=0.0.0.0 --port={args.server_port}')
+    uvicorn.run(app, host='0.0.0.0', port=args.server_port)
